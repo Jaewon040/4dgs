@@ -9,6 +9,7 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
+# scene/cameras.py 파일 수정
 import torch
 from torch import nn
 import numpy as np
@@ -30,24 +31,39 @@ class Camera(nn.Module):
         self.FoVy = FoVy
         self.image_name = image_name
         self.time = time
+        
+        # 데이터 장치 처리를 명시적으로 수행
         try:
             self.data_device = torch.device(data_device)
         except Exception as e:
             print(e)
             print(f"[Warning] Custom device {data_device} failed, fallback to default cuda device" )
             self.data_device = torch.device("cuda")
-        self.original_image = image.clamp(0.0, 1.0)[:3,:,:]
-        # breakpoint()
-        # .to(self.data_device)
+        
+        # 이미지를 명시적으로 대상 장치로 이동
+        if isinstance(image, torch.Tensor):
+            # 이미 torch 텐서인 경우
+            self.original_image = image.to(self.data_device).clamp(0.0, 1.0)[:3,:,:]
+        else:
+            # 이미지가 다른 형식인 경우 (예: numpy 배열, PIL 이미지)
+            self.original_image = torch.tensor(image, device=self.data_device).clamp(0.0, 1.0)[:3,:,:]
+        
         self.image_width = self.original_image.shape[2]
         self.image_height = self.original_image.shape[1]
 
+        # gt_alpha_mask 처리
         if gt_alpha_mask is not None:
+            # gt_alpha_mask도 대상 장치로 이동
+            if isinstance(gt_alpha_mask, torch.Tensor):
+                gt_alpha_mask = gt_alpha_mask.to(self.data_device)
+            else:
+                gt_alpha_mask = torch.tensor(gt_alpha_mask, device=self.data_device)
+            
             self.original_image *= gt_alpha_mask
-            # .to(self.data_device)
         else:
-            self.original_image *= torch.ones((1, self.image_height, self.image_width))
-                                                #   , device=self.data_device)
+            # 마스크가 없으면 1로 채워진 텐서 생성
+            self.original_image *= torch.ones((1, self.image_height, self.image_width), device=self.data_device)
+        
         self.depth = depth
         self.mask = mask
         self.zfar = 100.0
@@ -56,10 +72,8 @@ class Camera(nn.Module):
         self.trans = trans
         self.scale = scale
 
-        self.world_view_transform = torch.tensor(getWorld2View2(R, T, trans, scale)).transpose(0, 1)
-        # .cuda()
-        self.projection_matrix = getProjectionMatrix(znear=self.znear, zfar=self.zfar, fovX=self.FoVx, fovY=self.FoVy).transpose(0,1)
-        # .cuda()
+        self.world_view_transform = torch.tensor(getWorld2View2(R, T, trans, scale)).transpose(0, 1).to(self.data_device)
+        self.projection_matrix = getProjectionMatrix(znear=self.znear, zfar=self.zfar, fovX=self.FoVx, fovY=self.FoVy).transpose(0,1).to(self.data_device)
         self.full_proj_transform = (self.world_view_transform.unsqueeze(0).bmm(self.projection_matrix.unsqueeze(0))).squeeze(0)
         self.camera_center = self.world_view_transform.inverse()[3, :3]
 
