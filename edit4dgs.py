@@ -3,13 +3,14 @@ import torch
 import numpy as np
 from PIL import Image
 import argparse
+from argparse import Namespace
 from tqdm import tqdm
 import torch.nn.functional as F
-from scene import Scene
 from scene.gaussian_model import GaussianModel, BasicPointCloud
 from utils.general_utils import safe_state
 from arguments import ModelParams, PipelineParams, OptimizationParams, ModelHiddenParams
 from gaussian_renderer import render
+from utils.render_utils import get_state_at_time
 from utils.loss_utils import l1_loss, ssim
 from diffusers import StableDiffusionInstructPix2PixPipeline
 
@@ -52,35 +53,171 @@ def edit_4dgs():
     
     # 모델 로드
     print(f"{args.model_path}에서 모델 로드 중...")
-    model_args = model_params.extract(args)
     
-    # 가우시안 모델 생성 및 로드
-    gaussians = GaussianModel(3, hyper_params.extract(args))  # 기본 SH 차수 3 사용
-    scene = Scene(model_args, gaussians)
+    # 체크포인트 로드
+    iteration_folders = [f for f in os.listdir(os.path.join(args.model_path, "point_cloud")) if f.startswith("iteration_")]
+    if not iteration_folders:
+        print("모델 폴더에서 iteration 폴더를 찾을 수 없습니다.")
+        return
+    
+    # 마지막 반복 폴더 선택
+    iteration_folders.sort(key=lambda x: int(x.split("_")[1]))
+    latest_folder = iteration_folders[-1]
+    checkpoint_path = os.path.join(args.model_path, "point_cloud", latest_folder)
+    
+    # 점 구름 로드
+    ply_path = os.path.join(checkpoint_path, "point_cloud.ply")
+    
+    # 원본 하이퍼파라미터로 GaussianModel 생성
+    hyper_args = hyper_params.extract(args)
+    
+    # 시간 해상도와 특성 차원을 확인하기 위해 원본 모델 구성 로드
+    # jumpingjacks.py의 설정을 가져오기 위한 코드
+    print("원본 모델의 올바른 구성 확인 중...")
+    if args.configs:
+        # 원본 hyper_args에 대해 무수정
+        pass
+    else:
+        # jumpingjacks 모델용 하드코딩된 설정
+        jumpingjacks_config = {
+            'kplanes_config': {
+                'grid_dimensions': 2,
+                'input_coordinate_dim': 4,
+                'output_coordinate_dim': 32,
+                'resolution': [64, 64, 64, 100]  # 점프잭 해상도
+            },
+            'multires': [1, 2],
+            'defor_depth': 0,
+            'net_width': 64,
+            'plane_tv_weight': 0.0001,
+            'time_smoothness_weight': 0.01,
+            'l1_time_planes': 0.0001,
+            'weights_constraint_init': 1,
+            'weights_constraint_after': 0.2,
+            'weight_decay_iteration': 5000,
+            'bounds': 1.6,
+            'no_dx': False,
+            'no_grid': False,
+            'no_ds': False,
+            'no_dr': False,
+            'no_do': True,
+            'no_dshs': True,
+            'empty_voxel': False,
+            'grid_pe': 0,
+            'static_mlp': False,
+            'apply_rotation': False
+        }
+        
+        # 딕셔너리를 Namespace 객체로 변환
+        hyper_args = Namespace(**jumpingjacks_config)
+    
+    # 가우시안 모델 생성
+    gaussians = GaussianModel(3, hyper_args)  # 기본 SH 차수 3 사용
+    
+    # 점 구름 로드
+    gaussians.load_ply(ply_path)
+    
+    # 변형 가중치 로드
+    deformation_path = os.path.join(checkpoint_path, "deformation.pth")
+    if os.path.exists(deformation_path):
+        weight_dict = torch.load(deformation_path, map_location="cuda")
+        
+        try:
+            gaussians._deformation.load_state_dict(weight_dict, strict=False)  # strict=False로 설정해 누락된 키 무시
+            print("변형 가중치 로드 성공!")
+            
+            gaussians._deformation = gaussians._deformation.to("cuda")
+            gaussians._deformation_table = torch.gt(torch.ones((gaussians.get_xyz.shape[0]), device="cuda"), 0)
+            
+            if os.path.exists(os.path.join(checkpoint_path, "deformation_table.pth")):
+                gaussians._deformation_table = torch.load(os.path.join(checkpoint_path, "deformation_table.pth"), map_location="cuda")
+            
+            if os.path.exists(os.path.join(checkpoint_path, "deformation_accum.pth")):
+                gaussians._deformation_accum = torch.load(os.path.join(checkpoint_path, "deformation_accum.pth"), map_location="cuda")
+            else:
+                gaussians._deformation_accum = torch.zeros((gaussians.get_xyz.shape[0], 3), device="cuda")
+                
+        except RuntimeError as e:
+            print(f"변형 가중치 로드 오류: {e}")
+            print("모델이 로드될 수 없습니다. 모델 구성을 확인하세요.")
+            return
     
     # 렌더링 설정
     bg_color = [1, 1, 1] if args.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
     pipe = pipeline_params.extract(args)
     
-    # t=0 카메라 가져오기
-    train_cameras = scene.getTrainCameras()
-    t0_cameras = []
-    for i, cam in enumerate(train_cameras):
-        if i < args.num_views:  # 지정된 수의 카메라만 가져오기
-            cam.time = 0.0  # 시간을 0으로 설정
-            t0_cameras.append(cam)
+    # 카메라 설정 (간단한 테스트 카메라, t=0 고정)
+    from scene.cameras import Camera
     
-    # 원본 t=0 이미지 렌더링
+    # 간단한 카메라 설정 (실제로는 원본 데이터셋에서 카메라를 로드해야 함)
+    # 이 부분은 실제 데이터셋에 따라 수정 필요
+    test_cameras = []
+    
+    # 임의의 카메라 위치 및 방향 설정
+    # 원형으로 배치된 카메라 생성
+    fov = 40  # 시야각 (도)
+    fov_rad = fov * np.pi / 180  # 라디안으로 변환
+    distance = 3.0  # 중심으로부터의 거리
+    
+    for i in range(args.num_views):
+        angle = 2 * np.pi * i / args.num_views
+        x = distance * np.sin(angle)
+        z = distance * np.cos(angle)
+        y = 0.5  # 약간 위에서 내려다 보는 위치
+        
+        # 카메라는 항상 원점을 바라봄
+        look_at = np.array([0, 0, 0])
+        position = np.array([x, y, z])
+        up = np.array([0, 1, 0])
+        
+        # 방향 계산
+        forward = look_at - position
+        forward = forward / np.linalg.norm(forward)
+        
+        right = np.cross(forward, up)
+        right = right / np.linalg.norm(right)
+        
+        up = np.cross(right, forward)
+        
+        # 회전 행렬 생성
+        R = np.stack([right, up, -forward], axis=0)  # 열 벡터를 쌓아서 행렬 생성
+        T = -position @ R  # 카메라 위치를 이동 벡터로 변환
+        
+        # 카메라 파라미터 설정
+        width, height = 800, 800
+        fx = fy = height / (2 * np.tan(fov_rad / 2))
+        
+        camera = Camera(
+            colmap_id=i,
+            R=R,
+            T=T,
+            FoVx=fov_rad,
+            FoVy=fov_rad,
+            image=torch.zeros((3, height, width), device="cuda"),  # 더미 이미지
+            gt_alpha_mask=None,
+            image_name=f"view_{i:03d}",
+            uid=i,
+            time=0.0  # 시간은 항상 0으로 설정
+        )
+        
+        test_cameras.append(camera)
+    
+    # 원본 이미지 렌더링
     original_images = []
     print("원본 이미지 렌더링 중...")
-    for i, cam in enumerate(tqdm(t0_cameras)):
-        render_pkg = render(cam, gaussians, pipe, background, stage="fine")
-        image = render_pkg["render"]
-        # 저장을 위해 PIL로 변환
-        pil_img = Image.fromarray((image.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8))
-        pil_img.save(os.path.join(args.edit_output_path, f"renders_original/view_{i:03d}.png"))
-        original_images.append(image)
+    for i, cam in enumerate(tqdm(test_cameras)):
+        # 오류가 발생할 수 있으므로 예외 처리 추가
+        try:
+            render_pkg = render(cam, gaussians, pipe, background, stage="fine")
+            image = render_pkg["render"]
+            # 저장을 위해 PIL로 변환
+            pil_img = Image.fromarray((image.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8))
+            pil_img.save(os.path.join(args.edit_output_path, f"renders_original/view_{i:03d}.png"))
+            original_images.append(image)
+        except Exception as e:
+            print(f"이미지 {i} 렌더링 중 오류 발생: {e}")
+            return
     
     # InstructPix2Pix 파이프라인 로드
     print("IP2P 모델 로드 중...")
@@ -150,20 +287,20 @@ def edit_4dgs():
             shutil.copy(src_deform_accum_path, os.path.join(model_dir, "deformation_accum.pth"))
     
     # 최적화 루프
-    print(f"{args.iterations}번의 반복으로 최적화 시작...")
+    print(f"{args.iterations_2}번의 반복으로 최적화 시작...")
     best_loss = float('inf')
     
-    for iteration in tqdm(range(args.iterations)):
+    for iteration in tqdm(range(args.iterations_2)):
         # 이번 반복을 위한 카메라 랜덤 선택
-        cam_idx = torch.randint(0, len(t0_cameras), (1,)).item()
-        viewpoint_cam = t0_cameras[cam_idx]
+        cam_idx = torch.randint(0, len(test_cameras), (1,)).item()
+        viewpoint_cam = test_cameras[cam_idx]
         target_image = edited_images[cam_idx]
         
         # 현재 포인트 클라우드 렌더링
         render_pkg = render(viewpoint_cam, gaussians, pipe, background, stage="fine")
         rendered_image = render_pkg["render"]
         
-        # 손실 계산 - L1 손실 및 SSIM 손실 조합
+        # 손실 계산 - L1 손실 및 SSIM
         l1 = l1_loss(rendered_image, target_image)
         ssim_loss = 1.0 - ssim(rendered_image.unsqueeze(0), target_image.unsqueeze(0))
         loss = l1 + 0.2 * ssim_loss
@@ -185,7 +322,7 @@ def edit_4dgs():
             save_checkpoint(iteration + 1)
     
     # 최종 모델 저장
-    save_checkpoint(args.iterations)
+    save_checkpoint(args.iterations_2)
     print(f"최적화 완료. 최종 모델이 {args.edit_output_path}에 저장되었습니다.")
     
     # 최종 결과 렌더링 및 평가
@@ -193,7 +330,7 @@ def edit_4dgs():
     final_renders_path = os.path.join(args.edit_output_path, "final_renders")
     os.makedirs(final_renders_path, exist_ok=True)
     
-    for i, cam in enumerate(tqdm(t0_cameras)):
+    for i, cam in enumerate(tqdm(test_cameras)):
         render_pkg = render(cam, gaussians, pipe, background, stage="fine")
         final_image = render_pkg["render"]
         
